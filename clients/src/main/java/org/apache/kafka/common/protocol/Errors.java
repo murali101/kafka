@@ -84,6 +84,7 @@ import org.apache.kafka.common.errors.OperationNotAttemptedException;
 import org.apache.kafka.common.errors.OutOfOrderSequenceException;
 import org.apache.kafka.common.errors.PolicyViolationException;
 import org.apache.kafka.common.errors.PreferredLeaderNotAvailableException;
+import org.apache.kafka.common.errors.PrincipalDeserializationException;
 import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.errors.ReassignmentInProgressException;
 import org.apache.kafka.common.errors.RebalanceInProgressException;
@@ -114,7 +115,7 @@ import org.apache.kafka.common.errors.UnsupportedCompressionTypeException;
 import org.apache.kafka.common.errors.UnsupportedForMessageFormatException;
 import org.apache.kafka.common.errors.UnsupportedSaslMechanismException;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
-import org.apache.kafka.common.internals.InvalidProducerEpochException;
+import org.apache.kafka.common.errors.InvalidProducerEpochException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -132,6 +133,8 @@ import java.util.function.Function;
  * the client if the request version suggests that the client may not recognize the new error code.
  *
  * Do not add exceptions that occur only on the client or only on the server here.
+ *
+ * @see org.apache.kafka.common.network.SslTransportLayer
  */
 public enum Errors {
     UNKNOWN_SERVER_ERROR(-1, "The server experienced an unexpected error when processing the request.",
@@ -338,7 +341,9 @@ public enum Errors {
     INCONSISTENT_VOTER_SET(94, "Indicates that the either the sender or recipient of a " +
             "voter-only request is not one of the expected voters", InconsistentVoterSetException::new),
     INVALID_UPDATE_VERSION(95, "The given update version was invalid.", InvalidUpdateVersionException::new),
-    FEATURE_UPDATE_FAILED(96, "Unable to update finalized features due to an unexpected server error.", FeatureUpdateFailedException::new);
+    FEATURE_UPDATE_FAILED(96, "Unable to update finalized features due to an unexpected server error.", FeatureUpdateFailedException::new),
+    PRINCIPAL_DESERIALIZATION_FAILURE(97, "Request principal deserialization failed during forwarding. " +
+         "This indicates an internal error on the broker cluster security setup.", PrincipalDeserializationException::new);
 
     private static final Logger log = LoggerFactory.getLogger(Errors.class);
 

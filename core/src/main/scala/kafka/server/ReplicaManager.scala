@@ -36,13 +36,16 @@ import kafka.server.checkpoints.{LazyOffsetCheckpoints, OffsetCheckpointFile, Of
 import kafka.utils._
 import kafka.utils.Implicits._
 import kafka.zk.KafkaZkClient
-import org.apache.kafka.common.{ElectionType, IsolationLevel, Node, TopicPartition}
+import org.apache.kafka.common.{ElectionType, IsolationLevel, Node, TopicPartition, Uuid}
 import org.apache.kafka.common.errors._
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.message.LeaderAndIsrRequestData.LeaderAndIsrPartitionState
 import org.apache.kafka.common.message.DeleteRecordsResponseData.DeleteRecordsPartitionResult
 import org.apache.kafka.common.message.{DescribeLogDirsResponseData, FetchResponseData, LeaderAndIsrResponseData}
+import org.apache.kafka.common.message.LeaderAndIsrResponseData.LeaderAndIsrTopicError
 import org.apache.kafka.common.message.LeaderAndIsrResponseData.LeaderAndIsrPartitionError
+import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData.{OffsetForLeaderTopic}
+import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData.{OffsetForLeaderTopicResult, EpochEndOffset}
 import org.apache.kafka.common.message.StopReplicaRequestData.StopReplicaPartitionState
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.network.ListenerName
@@ -52,7 +55,6 @@ import org.apache.kafka.common.record._
 import org.apache.kafka.common.replica.PartitionView.DefaultPartitionView
 import org.apache.kafka.common.replica.ReplicaView.DefaultReplicaView
 import org.apache.kafka.common.replica.{ClientMetadata, _}
-import org.apache.kafka.common.requests.EpochEndOffset._
 import org.apache.kafka.common.requests.FetchRequest.PartitionData
 import org.apache.kafka.common.requests.FetchResponse.AbortedTransaction
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse
@@ -293,9 +295,11 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   def recordIsrChange(topicPartition: TopicPartition): Unit = {
-    isrChangeSet synchronized {
-      isrChangeSet += topicPartition
-      lastIsrChangeMs.set(time.milliseconds())
+    if (!config.interBrokerProtocolVersion.isAlterIsrSupported) {
+      isrChangeSet synchronized {
+        isrChangeSet += topicPartition
+        lastIsrChangeMs.set(time.milliseconds())
+      }
     }
   }
   /**
@@ -340,7 +344,7 @@ class ReplicaManager(val config: KafkaConfig,
     // A follower can lag behind leader for up to config.replicaLagTimeMaxMs x 1.5 before it is removed from ISR
     scheduler.schedule("isr-expiration", maybeShrinkIsr _, period = config.replicaLagTimeMaxMs / 2, unit = TimeUnit.MILLISECONDS)
     // If using AlterIsr, we don't need the znode ISR propagation
-    if (config.interBrokerProtocolVersion < KAFKA_2_7_IV2) {
+    if (!config.interBrokerProtocolVersion.isAlterIsrSupported) {
       scheduler.schedule("isr-change-propagation", maybePropagateIsrChanges _,
         period = isrChangeNotificationConfig.checkIntervalMs, unit = TimeUnit.MILLISECONDS)
     } else {
@@ -1328,6 +1332,7 @@ class ReplicaManager(val config: KafkaConfig,
             s"correlation id $correlationId from controller $controllerId " +
             s"epoch ${leaderAndIsrRequest.controllerEpoch}")
         }
+      val topicIds = leaderAndIsrRequest.topicIds()
 
       val response = {
         if (leaderAndIsrRequest.controllerEpoch < controllerEpoch) {
@@ -1434,6 +1439,24 @@ class ReplicaManager(val config: KafkaConfig,
            */
             if (localLog(topicPartition).isEmpty)
               markPartitionOffline(topicPartition)
+            else {
+              val id = topicIds.get(topicPartition.topic())
+              // Ensure we have not received a request from an older protocol
+              if (id != null && !id.equals(Uuid.ZERO_UUID)) {
+                val log = localLog(topicPartition).get
+                // Check if topic ID is in memory, if not, it must be new to the broker and does not have a metadata file.
+                // This is because if the broker previously wrote it to file, it would be recovered on restart after failure.
+                if (log.topicId.equals(Uuid.ZERO_UUID)) {
+                  log.partitionMetadataFile.get.write(id)
+                  log.topicId = id
+                  // Warn if the topic ID in the request does not match the log.
+                } else if (!log.topicId.equals(id)) {
+                  stateChangeLogger.warn(s"Topic Id in memory: ${log.topicId.toString} does not" +
+                    s" match the topic Id provided in the request: " +
+                    s"${id.toString}.")
+                }
+              }
+            }
           }
 
           // we initialize highwatermark thread after the first leaderisrrequest. This ensures that all the partitions
@@ -1445,15 +1468,38 @@ class ReplicaManager(val config: KafkaConfig,
           replicaFetcherManager.shutdownIdleFetcherThreads()
           replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
           onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
-          val responsePartitions = responseMap.iterator.map { case (tp, error) =>
-            new LeaderAndIsrPartitionError()
-              .setTopicName(tp.topic)
-              .setPartitionIndex(tp.partition)
-              .setErrorCode(error.code)
-          }.toBuffer
-          new LeaderAndIsrResponse(new LeaderAndIsrResponseData()
-            .setErrorCode(Errors.NONE.code)
-            .setPartitionErrors(responsePartitions.asJava))
+          if (leaderAndIsrRequest.version() < 5) {
+            val responsePartitions = responseMap.iterator.map { case (tp, error) =>
+              new LeaderAndIsrPartitionError()
+                .setTopicName(tp.topic)
+                .setPartitionIndex(tp.partition)
+                .setErrorCode(error.code)
+            }.toBuffer
+            new LeaderAndIsrResponse(new LeaderAndIsrResponseData()
+              .setErrorCode(Errors.NONE.code)
+              .setPartitionErrors(responsePartitions.asJava), leaderAndIsrRequest.version())
+          } else {
+            val topics = new mutable.HashMap[String, List[LeaderAndIsrPartitionError]]
+            responseMap.asJava.forEach { case (tp, error) =>
+              if (!topics.contains(tp.topic)) {
+                topics.put(tp.topic, List(new LeaderAndIsrPartitionError()
+                                                                .setPartitionIndex(tp.partition)
+                                                                .setErrorCode(error.code)))
+              } else {
+                topics.put(tp.topic, new LeaderAndIsrPartitionError()
+                  .setPartitionIndex(tp.partition)
+                  .setErrorCode(error.code)::topics(tp.topic))
+              }
+            }
+            val topicErrors = topics.iterator.map { case (topic, partitionError) =>
+              new LeaderAndIsrTopicError()
+                .setTopicId(topicIds.get(topic))
+                .setPartitionErrors(partitionError.asJava)
+            }.toBuffer
+            new LeaderAndIsrResponse(new LeaderAndIsrResponseData()
+              .setErrorCode(Errors.NONE.code)
+              .setTopics(topicErrors.asJava), leaderAndIsrRequest.version())
+          }
         }
       }
       val endMs = time.milliseconds()
@@ -1667,9 +1713,10 @@ class ReplicaManager(val config: KafkaConfig,
         val partitionsToMakeFollowerWithLeaderAndOffset = partitionsToMakeFollower.map { partition =>
           val leader = metadataCache.getAliveBrokers.find(_.id == partition.leaderReplicaIdOpt.get).get
             .brokerEndPoint(config.interBrokerListenerName)
-          val fetchOffset = partition.localLogOrException.highWatermark
+          val log = partition.localLogOrException
+          val fetchOffset = initialFetchOffset(log)
           partition.topicPartition -> InitialFetchState(leader, partition.getLeaderEpoch, fetchOffset)
-       }.toMap
+        }.toMap
 
         replicaFetcherManager.addFetcherForPartitions(partitionsToMakeFollowerWithLeaderAndOffset)
       }
@@ -1689,6 +1736,18 @@ class ReplicaManager(val config: KafkaConfig,
       }
 
     partitionsToMakeFollower
+  }
+
+  /**
+   * From IBP 2.7 onwards, we send latest fetch epoch in the request and truncate if a
+   * diverging epoch is returned in the response, avoiding the need for a separate
+   * OffsetForLeaderEpoch request.
+   */
+  private def initialFetchOffset(log: Log): Long = {
+    if (ApiVersion.isTruncationOnFetchSupported(config.interBrokerProtocolVersion) && log.latestEpoch.nonEmpty)
+      log.logEndOffset
+    else
+      log.highWatermark
   }
 
   private def maybeShrinkIsr(): Unit = {
@@ -1862,23 +1921,45 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  def lastOffsetForLeaderEpoch(requestedEpochInfo: Map[TopicPartition, OffsetsForLeaderEpochRequest.PartitionData]): Map[TopicPartition, EpochEndOffset] = {
-    requestedEpochInfo.map { case (tp, partitionData) =>
-      val epochEndOffset = getPartition(tp) match {
-        case HostedPartition.Online(partition) =>
-          partition.lastOffsetForLeaderEpoch(partitionData.currentLeaderEpoch, partitionData.leaderEpoch,
-            fetchOnlyFromLeader = true)
+  def lastOffsetForLeaderEpoch(
+    requestedEpochInfo: Seq[OffsetForLeaderTopic]
+  ): Seq[OffsetForLeaderTopicResult] = {
+    requestedEpochInfo.map { offsetForLeaderTopic =>
+      val partitions = offsetForLeaderTopic.partitions.asScala.map { offsetForLeaderPartition =>
+        val tp = new TopicPartition(offsetForLeaderTopic.topic, offsetForLeaderPartition.partition)
+        getPartition(tp) match {
+          case HostedPartition.Online(partition) =>
+            val currentLeaderEpochOpt =
+              if (offsetForLeaderPartition.currentLeaderEpoch == RecordBatch.NO_PARTITION_LEADER_EPOCH)
+                Optional.empty[Integer]
+              else
+                Optional.of[Integer](offsetForLeaderPartition.currentLeaderEpoch)
 
-        case HostedPartition.Offline =>
-          new EpochEndOffset(Errors.KAFKA_STORAGE_ERROR, UNDEFINED_EPOCH, UNDEFINED_EPOCH_OFFSET)
+            partition.lastOffsetForLeaderEpoch(
+              currentLeaderEpochOpt,
+              offsetForLeaderPartition.leaderEpoch,
+              fetchOnlyFromLeader = true)
 
-        case HostedPartition.None if metadataCache.contains(tp) =>
-          new EpochEndOffset(Errors.NOT_LEADER_OR_FOLLOWER, UNDEFINED_EPOCH, UNDEFINED_EPOCH_OFFSET)
+          case HostedPartition.Offline =>
+            new EpochEndOffset()
+              .setPartition(offsetForLeaderPartition.partition)
+              .setErrorCode(Errors.KAFKA_STORAGE_ERROR.code)
 
-        case HostedPartition.None =>
-          new EpochEndOffset(Errors.UNKNOWN_TOPIC_OR_PARTITION, UNDEFINED_EPOCH, UNDEFINED_EPOCH_OFFSET)
+          case HostedPartition.None if metadataCache.contains(tp) =>
+            new EpochEndOffset()
+              .setPartition(offsetForLeaderPartition.partition)
+              .setErrorCode(Errors.NOT_LEADER_OR_FOLLOWER.code)
+
+          case HostedPartition.None =>
+            new EpochEndOffset()
+              .setPartition(offsetForLeaderPartition.partition)
+              .setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
+        }
       }
-      tp -> epochEndOffset
+
+      new OffsetForLeaderTopicResult()
+        .setTopic(offsetForLeaderTopic.topic)
+        .setPartitions(partitions.toList.asJava)
     }
   }
 

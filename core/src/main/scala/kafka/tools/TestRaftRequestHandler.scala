@@ -18,6 +18,7 @@
 package kafka.tools
 
 import kafka.network.RequestChannel
+import kafka.network.RequestConvertToJson
 import kafka.raft.KafkaNetworkChannel
 import kafka.server.ApiRequestHandler
 import kafka.utils.Logging
@@ -92,9 +93,9 @@ class TestRaftRequestHandler(
 
     val response = responseOpt match {
       case Some(response) =>
-        val responseSend = request.context.buildResponse(response)
+        val responseSend = request.context.buildResponseSend(response)
         val responseString =
-          if (RequestChannel.isRequestLoggingEnabled) Some(response.toString(request.context.apiVersion))
+          if (RequestChannel.isRequestLoggingEnabled) Some(RequestConvertToJson.response(response, request.context.apiVersion))
           else None
         new RequestChannel.SendResponse(request, responseSend, responseString, None)
       case None =>

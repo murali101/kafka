@@ -44,6 +44,7 @@ import org.apache.kafka.common.requests.BeginQuorumEpochRequest;
 import org.apache.kafka.common.requests.BeginQuorumEpochResponse;
 import org.apache.kafka.common.requests.DescribeQuorumResponse;
 import org.apache.kafka.common.requests.EndQuorumEpochRequest;
+import org.apache.kafka.common.requests.EndQuorumEpochResponse;
 import org.apache.kafka.common.requests.VoteRequest;
 import org.apache.kafka.common.requests.VoteResponse;
 import org.apache.kafka.common.utils.LogContext;
@@ -77,7 +78,7 @@ import static org.apache.kafka.raft.RaftUtil.hasValidTopicPartition;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-final class RaftClientTestContext {
+public final class RaftClientTestContext {
     private static final StringSerde STRING_SERDE = new StringSerde();
 
     final TopicPartition metadataPartition = Builder.METADATA_PARTITION;
@@ -85,14 +86,15 @@ final class RaftClientTestContext {
     final int electionTimeoutMs = Builder.DEFAULT_ELECTION_TIMEOUT_MS;
     final int electionFetchMaxWaitMs = Builder.FETCH_MAX_WAIT_MS;
     final int fetchTimeoutMs = Builder.FETCH_TIMEOUT_MS;
-    final int requestTimeoutMs = Builder.REQUEST_TIMEOUT_MS;
+    final int requestTimeoutMs = Builder.DEFAULT_REQUEST_TIMEOUT_MS;
     final int retryBackoffMs = Builder.RETRY_BACKOFF_MS;
 
     private final QuorumStateStore quorumStateStore;
+    private final QuorumState quorum;
     final int localId;
-    final KafkaRaftClient<String> client;
+    public final KafkaRaftClient<String> client;
     final Metrics metrics;
-    final MockLog log;
+    public final MockLog log;
     final MockNetworkChannel channel;
     final MockTime time;
     final MockListener listener;
@@ -107,7 +109,7 @@ final class RaftClientTestContext {
         private static final int FETCH_MAX_WAIT_MS = 0;
         // fetch timeout is usually larger than election timeout
         private static final int FETCH_TIMEOUT_MS = 50000;
-        private static final int REQUEST_TIMEOUT_MS = 5000;
+        private static final int DEFAULT_REQUEST_TIMEOUT_MS = 5000;
         private static final int RETRY_BACKOFF_MS = 50;
         private static final int DEFAULT_APPEND_LINGER_MS = 0;
 
@@ -118,11 +120,12 @@ final class RaftClientTestContext {
         private final Set<Integer> voters;
         private final int localId;
 
+        private int requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
         private int electionTimeoutMs = DEFAULT_ELECTION_TIMEOUT_MS;
         private int appendLingerMs = DEFAULT_APPEND_LINGER_MS;
         private MemoryPool memoryPool = MemoryPool.NONE;
 
-        Builder(int localId, Set<Integer> voters) {
+        public Builder(int localId, Set<Integer> voters) {
             this.voters = voters;
             this.localId = localId;
         }
@@ -163,7 +166,17 @@ final class RaftClientTestContext {
             return this;
         }
 
-        RaftClientTestContext build() throws IOException {
+        Builder withElectionTimeoutMs(int electionTimeoutMs) {
+            this.electionTimeoutMs = electionTimeoutMs;
+            return this;
+        }
+
+        Builder withRequestTimeoutMs(int requestTimeoutMs) {
+            this.requestTimeoutMs = requestTimeoutMs;
+            return this;
+        }
+
+        public RaftClientTestContext build() throws IOException {
             Metrics metrics = new Metrics(time);
             MockNetworkChannel channel = new MockNetworkChannel();
             LogContext logContext = new LogContext();
@@ -190,7 +203,7 @@ final class RaftClientTestContext {
                 voterAddresses,
                 ELECTION_BACKOFF_MAX_MS,
                 RETRY_BACKOFF_MS,
-                REQUEST_TIMEOUT_MS,
+                requestTimeoutMs,
                 FETCH_MAX_WAIT_MS,
                 appendLingerMs,
                 logContext,
@@ -207,6 +220,7 @@ final class RaftClientTestContext {
                 channel,
                 time,
                 quorumStateStore,
+                quorum,
                 voters,
                 metrics,
                 listener
@@ -221,6 +235,7 @@ final class RaftClientTestContext {
         MockNetworkChannel channel,
         MockTime time,
         QuorumStateStore quorumStateStore,
+        QuorumState quorum,
         Set<Integer> voters,
         Metrics metrics,
         MockListener listener
@@ -231,6 +246,7 @@ final class RaftClientTestContext {
         this.channel = channel;
         this.time = time;
         this.quorumStateStore = quorumStateStore;
+        this.quorum = quorum;
         this.voters = voters;
         this.metrics = metrics;
         this.listener = listener;
@@ -354,6 +370,11 @@ final class RaftClientTestContext {
         assertEquals(ElectionState.withUnknownLeader(epoch, voters), quorumStateStore.readElectionState());
     }
 
+    void assertResignedLeader(int epoch, int leaderId) throws IOException {
+        assertTrue(quorum.isResigned());
+        assertEquals(ElectionState.withElectedLeader(epoch, leaderId, voters), quorumStateStore.readElectionState());
+    }
+
     int assertSentDescribeQuorumResponse(int leaderId,
                                                  int leaderEpoch,
                                                  long highWatermark,
@@ -379,9 +400,9 @@ final class RaftClientTestContext {
         return raftMessage.correlationId();
     }
 
-    int assertSentVoteRequest(int epoch, int lastEpoch, long lastEpochOffset) {
+    int assertSentVoteRequest(int epoch, int lastEpoch, long lastEpochOffset, int numVoteReceivers) {
         List<RaftRequest.Outbound> voteRequests = collectVoteRequests(epoch, lastEpoch, lastEpochOffset);
-        assertEquals(1, voteRequests.size());
+        assertEquals(numVoteReceivers, voteRequests.size());
         return voteRequests.iterator().next().correlationId();
     }
 
@@ -436,9 +457,9 @@ final class RaftClientTestContext {
         channel.mockReceive(new RaftResponse.Inbound(correlationId, response, sourceId));
     }
 
-    int assertSentBeginQuorumEpochRequest(int epoch) {
+    int assertSentBeginQuorumEpochRequest(int epoch, int numBeginEpochRequests) {
         List<RaftRequest.Outbound> requests = collectBeginEpochRequests(epoch);
-        assertEquals(1, requests.size());
+        assertEquals(numBeginEpochRequests, requests.size());
         return requests.get(0).correlationId;
     }
 
@@ -462,9 +483,9 @@ final class RaftClientTestContext {
         assertEquals(partitionError, Errors.forCode(partitionResponse.errorCode()));
     }
     
-    int assertSentEndQuorumEpochRequest(int epoch, OptionalInt leaderId, int destinationId) {
+    int assertSentEndQuorumEpochRequest(int epoch, int destinationId) {
         List<RaftRequest.Outbound> endQuorumRequests = collectEndQuorumRequests(
-            epoch, leaderId, Collections.singleton(destinationId));
+            epoch, Collections.singleton(destinationId));
         assertEquals(1, endQuorumRequests.size());
         return endQuorumRequests.get(0).correlationId();
     }
@@ -553,7 +574,7 @@ final class RaftClientTestContext {
         assertSentFetchResponse(1L, epoch);
     }
 
-    List<RaftRequest.Outbound> collectEndQuorumRequests(int epoch, OptionalInt leaderId, Set<Integer> destinationIdSet) {
+    List<RaftRequest.Outbound> collectEndQuorumRequests(int epoch, Set<Integer> destinationIdSet) {
         List<RaftRequest.Outbound> endQuorumRequests = new ArrayList<>();
         Set<Integer> collectedDestinationIdSet = new HashSet<>();
         for (RaftMessage raftMessage : channel.drainSendQueue()) {
@@ -564,8 +585,7 @@ final class RaftClientTestContext {
                     request.topics().get(0).partitions().get(0);
 
                 assertEquals(epoch, partitionRequest.leaderEpoch());
-                assertEquals(leaderId.orElse(-1), partitionRequest.leaderId());
-                assertEquals(localId, partitionRequest.replicaId());
+                assertEquals(localId, partitionRequest.leaderId());
 
                 RaftRequest.Outbound outboundRequest = (RaftRequest.Outbound) raftMessage;
                 collectedDestinationIdSet.add(outboundRequest.destinationId());
@@ -626,16 +646,28 @@ final class RaftClientTestContext {
         return new InetSocketAddress("localhost", 9990 + id);
     }
 
+    EndQuorumEpochResponseData endEpochResponse(
+        int epoch,
+        OptionalInt leaderId
+    ) {
+        return EndQuorumEpochResponse.singletonResponse(
+            Errors.NONE,
+            metadataPartition,
+            Errors.NONE,
+            epoch,
+            leaderId.orElse(-1)
+        );
+    }
+
     EndQuorumEpochRequestData endEpochRequest(
         int epoch,
-        OptionalInt leaderId,
-        int replicaId,
-        List<Integer> preferredSuccessors) {
+        int leaderId,
+        List<Integer> preferredSuccessors
+    ) {
         return EndQuorumEpochRequest.singletonRequest(
             metadataPartition,
-            replicaId,
             epoch,
-            leaderId.orElse(-1),
+            leaderId,
             preferredSuccessors
         );
     }
@@ -700,6 +732,7 @@ final class RaftClientTestContext {
     static void verifyLeaderChangeMessage(
         int leaderId,
         List<Integer> voters,
+        List<Integer> grantingVoters,
         ByteBuffer recordKey,
         ByteBuffer recordValue
     ) {
@@ -709,6 +742,8 @@ final class RaftClientTestContext {
         assertEquals(leaderId, leaderChangeMessage.leaderId());
         assertEquals(voters.stream().map(voterId -> new Voter().setVoterId(voterId)).collect(Collectors.toList()),
             leaderChangeMessage.voters());
+        assertEquals(grantingVoters.stream().map(voterId -> new Voter().setVoterId(voterId)).collect(Collectors.toSet()),
+            new HashSet<>(leaderChangeMessage.grantingVoters()));
     }
 
     void assertFetchRequestData(
